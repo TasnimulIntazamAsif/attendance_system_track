@@ -14,12 +14,10 @@ from flask import Flask, render_template, Response, jsonify
 # CONFIG
 # =========================
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-KNOWN_DIR = os.path.join(APP_DIR, "known_faces")
 DATA_DIR = os.path.join(APP_DIR, "data")
 ENC_PATH = os.path.join(DATA_DIR, "encodings.pkl")
 CSV_PATH = os.path.join(DATA_DIR, "attendance.csv")
 
-os.makedirs(KNOWN_DIR, exist_ok=True)
 os.makedirs(DATA_DIR, exist_ok=True)
 
 CAMERA_INDEX = 0
@@ -56,9 +54,32 @@ known = load_encodings()
 
 
 # =========================
+# Confidence (heuristic)
+# =========================
+def distance_to_confidence(distance: float, tolerance: float) -> float:
+    if distance is None:
+        return 0.0
+
+    if distance <= tolerance:
+        conf = 100.0 - (distance / tolerance) * 50.0
+    else:
+        conf = 50.0 - ((distance - tolerance) / max(1e-6, (1.0 - tolerance))) * 50.0
+
+    return float(max(0.0, min(100.0, conf)))
+
+
+# =========================
 # Attendance logging
 # =========================
 def log_attendance(name: str, status: str, distance=None, accuracy=None):
+    """
+    RULE:
+      - If matched -> store real name
+      - If not matched/no face/no known -> store Unknown
+    """
+    if status != "Matched":
+        name = "Unknown"
+
     now = datetime.now()
     header_needed = not os.path.exists(CSV_PATH)
 
@@ -73,29 +94,7 @@ def log_attendance(name: str, status: str, distance=None, accuracy=None):
 
 
 # =========================
-# Confidence (heuristic)
-# =========================
-def distance_to_confidence(distance: float, tolerance: float) -> float:
-    """
-    Converts face distance to a confidence-like percentage.
-    NOTE: This is a heuristic (not a real probability).
-    """
-    if distance is None:
-        return 0.0
-
-    # If within tolerance => higher confidence
-    if distance <= tolerance:
-        # map [0..tolerance] -> [100..50]
-        conf = 100.0 - (distance / tolerance) * 50.0
-    else:
-        # map [tolerance..1.0] -> [50..0]
-        conf = 50.0 - ((distance - tolerance) / max(1e-6, (1.0 - tolerance))) * 50.0
-
-    return float(max(0.0, min(100.0, conf)))
-
-
-# =========================
-# Camera thread (fast)
+# Camera thread
 # =========================
 class Camera:
     def __init__(self, idx=0):
@@ -170,7 +169,7 @@ scan_lock = threading.Lock()
 
 
 # =========================
-# Match face (returns distance + accuracy)
+# Face match
 # =========================
 def match_face(frame_bgr):
     if len(known["encodings"]) == 0:
@@ -238,18 +237,19 @@ def scan():
 
         res = match_face(frame)
 
+        # ✅ Always log:
+        # - Matched -> store real name
+        # - Others  -> store Unknown
+        log_attendance(res["name"], res["status"], res["distance"], res["accuracy"])
+
         if res["status"] == "Matched":
-            log_attendance(res["name"], "Matched", res["distance"], res["accuracy"])
             msg = f"✅ Matched: {res['name']} | Accuracy: {res['accuracy']:.1f}% | Distance: {res['distance']:.3f}"
         elif res["status"] == "No Face":
-            log_attendance("Unknown", "No Face", None, None)
-            msg = "⚠️ No face detected"
+            msg = "⚠️ No face detected (saved as Unknown)"
         elif res["status"] == "No Known Faces":
-            log_attendance("Unknown", "No Known Faces", None, None)
-            msg = "⚠️ No known faces. Build encodings first."
+            msg = "⚠️ No known faces loaded (saved as Unknown)"
         else:
-            log_attendance("Unknown", "Not Matched", res["distance"], res["accuracy"])
-            msg = f"❌ Not Matched | Accuracy: {res['accuracy']:.1f}% | Distance: {res['distance']:.3f}"
+            msg = f"❌ Not Matched (saved as Unknown) | Accuracy: {res['accuracy']:.1f}% | Distance: {res['distance']:.3f}"
 
         return jsonify({"ok": True, "result": res, "message": msg})
     finally:
@@ -263,9 +263,6 @@ def reload():
     return jsonify({"ok": True, "count": len(known["names"])})
 
 
-# =========================
-# Run (disable reloader)
-# =========================
 if __name__ == "__main__":
     camera.start()
     app.run(host="127.0.0.1", port=5000, debug=True, threaded=True, use_reloader=False)
