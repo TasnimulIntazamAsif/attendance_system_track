@@ -1,20 +1,55 @@
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Attendance System</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+  <meta charset="utf-8">
+  <title>Face Attendance</title>
+  <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-    <div class="container">
-        <h1>Webcam Attendance System</h1>
-        <div class="webcam">
-            <img src="{{ url_for('video_feed') }}" alt="Webcam Feed" id="webcam">
-        </div>
-        <div id="attendance-status">
-            <h2>Waiting for face scan...</h2>
-        </div>
-    </div>
+<div class="wrap">
+  <h2>Face Attendance</h2>
+
+  <div class="box">
+    <img src="/video_feed" alt="webcam">
+  </div>
+
+  <div class="controls">
+    <button id="scan">Scan</button>
+    <button id="reload">Reload Known</button>
+    <label><input type="checkbox" id="auto" checked> Auto every 1.5s</label>
+  </div>
+
+  <div id="status" class="status">Ready.</div>
+</div>
+
+<script>
+const statusEl = document.getElementById("status");
+const auto = document.getElementById("auto");
+let busy = false;
+
+async function scanOnce(){
+  if(busy) return;
+  busy = true;
+  try{
+    const r = await fetch("/scan", {method:"POST"});
+    const d = await r.json();
+    statusEl.textContent = d.message || "Done";
+  }catch(e){
+    statusEl.textContent = "Error: " + e.message;
+  }finally{
+    busy = false;
+  }
+}
+
+document.getElementById("scan").onclick = scanOnce;
+
+document.getElementById("reload").onclick = async () => {
+  const r = await fetch("/reload", {method:"POST"});
+  const d = await r.json();
+  statusEl.textContent = "Reloaded known faces: " + d.count;
+};
+
+setInterval(()=>{ if(auto.checked) scanOnce(); }, 1500);
+</script>
 </body>
 </html>

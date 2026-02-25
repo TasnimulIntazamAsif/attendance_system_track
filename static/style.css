@@ -1,0 +1,7 @@
+body{font-family:Arial;background:#f3f5f9;margin:0}
+.wrap{max-width:900px;margin:30px auto;padding:0 16px}
+.box{background:#000;border-radius:12px;overflow:hidden}
+img{width:100%;display:block}
+.controls{display:flex;gap:12px;align-items:center;margin-top:12px;flex-wrap:wrap}
+button{padding:10px 16px;border:none;border-radius:10px;background:#1f6feb;color:#fff;font-weight:700;cursor:pointer}
+.status{margin-top:12px;background:#fff;border-radius:10px;padding:12px;font-weight:700}
