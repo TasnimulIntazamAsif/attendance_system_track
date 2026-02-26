@@ -27,32 +27,69 @@ RECOG_RESIZE = 0.20
 WORKER_INTERVAL = 0.15
 AVG_ENCODING_FRAMES = 3
 
-# Unknown duplicate control (optional)
-SAVE_COOLDOWN_UNKNOWN = 10  # seconds
+# ✅ Prevent repeated saving for same person (in seconds)
+PERSON_EVENT_COOLDOWN = 10
 
-# ✅ NEW: store each matched person only once (per program run)
-SAVE_EACH_PERSON_ONCE = True
+# Unknown anti-spam
+UNKNOWN_COOLDOWN = 10
+
+CSV_HEADER = "timeframe,id,name,status,accuracy\n"
+
+# =========================
+# CSV HEADER ENFORCER
+# =========================
+def ensure_csv_header():
+    if not os.path.exists(CSV_PATH):
+        with open(CSV_PATH, "w", encoding="utf-8") as f:
+            f.write(CSV_HEADER)
+        return
+
+    try:
+        with open(CSV_PATH, "r", encoding="utf-8") as f:
+            first = f.readline()
+    except Exception:
+        first = ""
+
+    if first != CSV_HEADER:
+        backup = os.path.join(DATA_DIR, "attendance_old_backup.csv")
+        try:
+            if os.path.exists(backup):
+                os.remove(backup)
+        except:
+            pass
+
+        os.replace(CSV_PATH, backup)
+        with open(CSV_PATH, "w", encoding="utf-8") as f:
+            f.write(CSV_HEADER)
+
+        print(f"[INFO] Old CSV backed up to: {backup}")
+        print(f"[INFO] New CSV created with correct header: {CSV_PATH}")
+
+ensure_csv_header()
 
 # =========================
 # LOAD ENCODINGS
 # =========================
 if not os.path.exists(ENC_PATH):
-    raise SystemExit(f"[FAIL] encodings.pkl not found: {ENC_PATH}")
+    raise SystemExit("[FAIL] encodings.pkl not found. Run step4 first.")
 
 with open(ENC_PATH, "rb") as f:
     known = pickle.load(f)
 
-if len(known.get("encodings", [])) == 0:
-    raise SystemExit("[FAIL] No encodings. Run step4_build_encodings_debug.py first.")
+known_ids = known.get("ids", [])
+known_names = known.get("names", [])
+known_encs = known.get("encodings", [])
 
-print("[INFO] Known people:", known.get("names", []))
-print("[INFO] Encodings path:", ENC_PATH)
-print("[INFO] CSV path:", CSV_PATH)
+if len(known_encs) == 0:
+    raise SystemExit("[FAIL] No encodings found in encodings.pkl")
+
+print("[INFO] Loaded people:", list(zip(known_ids, known_names)))
+print("[INFO] CSV ->", CSV_PATH)
 
 # =========================
-# CONFIDENCE (heuristic)
+# ACCURACY (heuristic)
 # =========================
-def distance_to_confidence(distance):
+def distance_to_accuracy(distance):
     if distance is None:
         return 0.0
     if distance <= 0.35:
@@ -63,7 +100,7 @@ def distance_to_confidence(distance):
         return float(max(0.0, 70.0 - (distance - 0.45) * 100.0))
 
 # =========================
-# DRAW LABEL (auto-fit)
+# DRAW LABEL
 # =========================
 def draw_label(frame, text, org=(20, 60), base_scale=1.2, thickness=2, pad=10):
     h, w = frame.shape[:2]
@@ -82,79 +119,93 @@ def draw_label(frame, text, org=(20, 60), base_scale=1.2, thickness=2, pad=10):
     cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 255, 0), thickness, cv2.LINE_AA)
 
 # =========================
-# ATTENDANCE LOGGING
+# ✅ CHECK-IN/CHECK-OUT STATE
 # =========================
-# ✅ NEW: already saved matched people (per run)
-already_saved_people = set()
+# checked_state[id] = True means currently checked-in, next event will be Check Out
+checked_state = {}
+last_event_ts = {}  # last time we saved an event for this id
+last_unknown_ts = 0.0
 
-# for Unknown cooldown
-last_saved_unknown_ts = 0.0
-
-def log_attendance(name, status, distance, accuracy):
+def load_state_from_csv():
     """
-    Rules:
-      - Matched -> save person only ONCE (if enabled)
-      - Not Matched -> save Unknown (cooldown)
-      - No Face -> do not save
+    Reads existing CSV and sets checked_state based on last status for each ID:
+      - Last status "Check In" => checked_state[id]=True
+      - Last status "Check Out" => checked_state[id]=False
     """
-    global last_saved_unknown_ts
-
-    if status == "No Face":
+    if not os.path.exists(CSV_PATH):
         return
 
-    now = datetime.now()
-    header_needed = not os.path.exists(CSV_PATH)
+    try:
+        with open(CSV_PATH, "r", encoding="utf-8") as f:
+            header = f.readline()
+            for line in f:
+                parts = line.strip().split(",")
+                if len(parts) < 5:
+                    continue
+                _, pid, _, status, _ = parts[0], parts[1], parts[2], parts[3], parts[4]
+                if pid and pid != "Unknown":
+                    if status == "Check In":
+                        checked_state[pid] = True
+                    elif status == "Check Out":
+                        checked_state[pid] = False
+    except Exception as e:
+        print("[WARN] Could not load state from CSV:", e)
 
-    # ✅ matched person
-    if status == "Matched":
-        if SAVE_EACH_PERSON_ONCE and name in already_saved_people:
-            return  # don't save again
-        already_saved_people.add(name)
+load_state_from_csv()
 
-        with open(CSV_PATH, "a", encoding="utf-8") as f:
-            if header_needed:
-                f.write("date,time,name,status,distance,accuracy\n")
-            f.write(f"{now:%Y-%m-%d},{now:%H:%M:%S},{name},{status},{distance:.4f},{accuracy:.2f}\n")
+def append_csv(timeframe, pid, name, status, accuracy):
+    with open(CSV_PATH, "a", encoding="utf-8") as f:
+        f.write(f"{timeframe},{pid},{name},{status},{accuracy:.2f}\n")
 
-        print(f"[SAVED ONCE] {now:%H:%M:%S} | {name} | Matched | dist={distance:.4f} | acc={accuracy:.2f}%")
+def log_check_in_out(pid, name, accuracy):
+    """
+    Toggle logic:
+      if checked_state[pid] is False/missing => Check In
+      if checked_state[pid] is True         => Check Out
+    Applies per-person cooldown to avoid spam.
+    """
+    now_ts = time.time()
+    last_ts = last_event_ts.get(pid, 0.0)
+    if now_ts - last_ts < PERSON_EVENT_COOLDOWN:
+        return None  # no new event
+
+    last_event_ts[pid] = now_ts
+
+    currently_in = checked_state.get(pid, False)
+    status = "Check Out" if currently_in else "Check In"
+
+    # toggle state
+    checked_state[pid] = (status == "Check In")
+
+    timeframe = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    append_csv(timeframe, pid, name, status, accuracy)
+    print(f"[SAVED] {pid}-{name} | {status} | acc={accuracy:.2f}%")
+
+    return status
+
+def log_unknown(accuracy):
+    global last_unknown_ts
+    ts = time.time()
+    if ts - last_unknown_ts < UNKNOWN_COOLDOWN:
         return
 
-    # ❌ not matched -> Unknown (cooldown)
-    if status == "Not Matched":
-        ts = time.time()
-        if ts - last_saved_unknown_ts < SAVE_COOLDOWN_UNKNOWN:
-            return
-        last_saved_unknown_ts = ts
-
-        with open(CSV_PATH, "a", encoding="utf-8") as f:
-            if header_needed:
-                f.write("date,time,name,status,distance,accuracy\n")
-            dist_str = "" if distance is None else f"{distance:.4f}"
-            acc_str = "" if accuracy is None else f"{accuracy:.2f}"
-            f.write(f"{now:%Y-%m-%d},{now:%H:%M:%S},Unknown,Not Matched,{dist_str},{acc_str}\n")
-
-        print(f"[SAVED] {now:%H:%M:%S} | Unknown | Not Matched")
-        return
+    last_unknown_ts = ts
+    timeframe = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    append_csv(timeframe, "Unknown", "Unknown", "Not Matched", accuracy)
+    print(f"[SAVED] Unknown | Not Matched | acc={accuracy:.2f}%")
 
 # =========================
-# SHARED STATE
+# THREAD STATE
 # =========================
 lock = threading.Lock()
 latest_frame = None
 
-result_status = "Starting..."
-result_name = "Unknown"
-result_dist = None
-result_acc = 0.0
-
-enc_buf = []
+result_text = "Starting..."
 running = True
+enc_buf = []
 
-# =========================
-# WORKER THREAD (recognition)
-# =========================
 def worker_loop():
-    global result_status, result_name, result_dist, result_acc, enc_buf
+    global result_text, enc_buf
 
     while running:
         time.sleep(WORKER_INTERVAL)
@@ -169,16 +220,15 @@ def worker_loop():
         rgb = np.require(rgb, dtype=np.uint8, requirements=["C"])
 
         locs = face_recognition.face_locations(rgb, model=MODEL)
-
         if not locs:
-            result_status, result_name, result_dist, result_acc = "No Face", "Unknown", None, 0.0
+            result_text = "No Face"
             enc_buf = []
             continue
 
-        locs = [locs[0]]  # only first face for speed
+        locs = [locs[0]]  # first face only
         encs = face_recognition.face_encodings(rgb, locs)
         if not encs:
-            result_status, result_name, result_dist, result_acc = "No Face", "Unknown", None, 0.0
+            result_text = "No Face"
             enc_buf = []
             continue
 
@@ -188,25 +238,30 @@ def worker_loop():
 
         avg_enc = np.mean(np.array(enc_buf), axis=0)
 
-        dists = face_recognition.face_distance(known["encodings"], avg_enc)
+        dists = face_recognition.face_distance(known_encs, avg_enc)
         best = int(np.argmin(dists))
         best_dist = float(dists[best])
-        acc = distance_to_confidence(best_dist)
+        acc = distance_to_accuracy(best_dist)
 
         if best_dist <= TOLERANCE:
-            status = "Matched"
-            name = known["names"][best]
+            pid = known_ids[best]
+            name = known_names[best]
+
+            # decide / save event if cooldown passed
+            saved_status = log_check_in_out(pid, name, acc)
+
+            # show status even if not saved (based on current state)
+            # If saved_status is None, show what would be next? Better show "Detected"
+            current_in = checked_state.get(pid, False)
+            display_status = saved_status if saved_status else ("Checked In" if current_in else "Checked Out")
+            result_text = f"{pid}_{name} | {display_status} | acc={acc:.1f}%"
+
         else:
-            status = "Not Matched"
-            name = "Unknown"
-
-        result_status, result_name, result_dist, result_acc = status, name, best_dist, acc
-
-        # ✅ log (will save matched person only once)
-        log_attendance(name, status, best_dist, acc)
+            log_unknown(acc)
+            result_text = f"Not Matched | acc={acc:.1f}%"
 
 # =========================
-# CAMERA + DISPLAY LOOP
+# CAMERA + DISPLAY
 # =========================
 cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
 cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
@@ -217,18 +272,13 @@ cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 if not cap.isOpened():
     raise SystemExit("[FAIL] Camera not opened. Try CAMERA_INDEX=1")
 
-WIN = "Attendance System (One Save Per Person)"
+WIN = "Attendance System (Check In / Check Out)"
 cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
 cv2.setWindowProperty(WIN, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-t = threading.Thread(target=worker_loop, daemon=True)
-t.start()
+threading.Thread(target=worker_loop, daemon=True).start()
 
-print("[OK] Running. Matched person will be saved only ONCE. Q=quit, F=fullscreen toggle")
-
-fps_t0 = time.time()
-fps_count = 0
-shown_fps = 0
+print("[OK] Running... Q=quit")
 
 while True:
     ok, frame = cap.read()
@@ -238,29 +288,12 @@ while True:
     with lock:
         latest_frame = frame
 
-    fps_count += 1
-    if time.time() - fps_t0 >= 1.0:
-        shown_fps = fps_count
-        fps_count = 0
-        fps_t0 = time.time()
-
-    if result_dist is None:
-        text = f"{result_status} | FPS={shown_fps}"
-    else:
-        text = f"{result_status}: {result_name} | dist={result_dist:.3f} | acc={result_acc:.1f}% | FPS={shown_fps}"
-
-    draw_label(frame, text, org=(20, 60))
+    draw_label(frame, result_text, org=(20, 60))
     cv2.imshow(WIN, frame)
 
     key = cv2.waitKey(1) & 0xFF
     if key in (ord('q'), ord('Q')):
         break
-    if key in (ord('f'), ord('F')):
-        cur = cv2.getWindowProperty(WIN, cv2.WND_PROP_FULLSCREEN)
-        if cur == cv2.WINDOW_FULLSCREEN:
-            cv2.setWindowProperty(WIN, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
-        else:
-            cv2.setWindowProperty(WIN, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
 running = False
 cap.release()
