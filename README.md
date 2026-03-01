@@ -4,7 +4,11 @@ A real-time **face recognition based attendance system** built with **Flask, Ope
 The system uses a webcam to detect and recognize faces, mark attendance, and display matching accuracy.
 
 ---
-<img width="2241" height="1468" alt="Screenshot 2026-02-25 105942" src="https://github.com/user-attachments/assets/df2c8e70-c3d0-435f-adeb-e57c68a044bb" />
+<img width="2246" height="1475" alt="Screenshot 2026-02-25 115108" src="https://github.com/user-attachments/assets/df201ce6-d5f9-4991-95b3-fc6194354935" />
+
+<img width="2248" height="1472" alt="Screenshot 2026-02-25 115436" src="https://github.com/user-attachments/assets/5c236a3d-89c1-4303-bf6c-431259ae116d" />
+
+
 
 
 ## 🚀 Features
