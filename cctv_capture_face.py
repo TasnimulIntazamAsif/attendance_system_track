@@ -9,7 +9,7 @@ from ultralytics import YOLO
 # =========================
 # SETTINGS
 # =========================
-CCTV_URL = "rtsp://admin:boss321%23@192.168.2.62:554/cam/realmonitor?channel=1&subtype=0"
+CCTV_URL = "rtsp://admin:boss321%23@192.168.2.42:554/cam/realmonitor?channel=1&subtype=0"
 SAVE_DIR = "known_faces"
 PERSON_ID = "new_person"
 TARGET_SAMPLES = 1500
