@@ -1,148 +1,205 @@
 import os
 import cv2
-import numpy as np
-from datetime import datetime
+import torch
 import threading
+import time
+from collections import deque
 from ultralytics import YOLO
 
 # =========================
 # SETTINGS
 # =========================
-CCTV_URL = "rtsp://admin:boss321%23@192.168.2.42:554/cam/realmonitor?channel=1&subtype=0"  # Your CCTV camera URL with credentials
+CCTV_URL = "rtsp://admin:boss321%23@192.168.2.62:554/cam/realmonitor?channel=1&subtype=0"
 SAVE_DIR = "known_faces"
-PERSON_ID = "new_person"  # You can update this with some identifier
-PERSON_NAME = "CCTV_Face"  # Automatically tagged faces
-TARGET_SAMPLES = 15  # Number of samples to capture
-FRAME_SKIP = 10  # Process every 10th frame for faster performance
+PERSON_ID = "new_person"
+TARGET_SAMPLES = 1500
+
+FRAME_SKIP = 5
+CONF_THRESHOLD = 0.5
+FACE_MIN_SIZE = 80
+BLUR_THRESHOLD = 60
+RESIZE_WIDTH = 640
+SAVE_COOLDOWN = 3  # seconds
 
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 # =========================
-# Load YOLOv8 Model
+# LOAD YOLO (PERSON ONLY)
 # =========================
-model = YOLO("yolov8n.pt")  # Load the pre-trained YOLOv8 model (small version for fast performance)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = YOLO("yolo26s.pt")
+model.to(device)
+
+if device == "cuda":
+    model.model.half()
+
+print("[INFO] Device:", device)
 
 # =========================
-# Connect to CCTV Stream
+# FACE DETECTOR
 # =========================
-cap = cv2.VideoCapture(CCTV_URL)
+face_detector = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
+
+# =========================
+# CONNECT CCTV
+# =========================
+cap = cv2.VideoCapture(CCTV_URL, cv2.CAP_FFMPEG)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
 if not cap.isOpened():
-    print("[FAIL] Could not connect to CCTV camera. Check URL.")
-    exit(1)
+    print("[FAIL] CCTV not connected")
+    exit()
 
-print("[INFO] Connected to CCTV Stream.")
+print("[INFO] CCTV Connected")
 
 # =========================
-# THREADS for Optimized Capture
+# FRAME THREAD
 # =========================
-frame_queue = []
-frame_lock = threading.Lock()
+frame_queue = deque(maxlen=1)
 capture_flag = True
 
 def capture_frames():
     global capture_flag
-
     while capture_flag:
         ret, frame = cap.read()
-        if not ret:
-            continue
-
-        with frame_lock:
+        if ret:
             frame_queue.append(frame)
 
-        # Limit the frame queue size to avoid memory overload
-        if len(frame_queue) > 10:
-            with frame_lock:
-                frame_queue.pop(0)
-
-# Start frame capturing in a separate thread
-capture_thread = threading.Thread(target=capture_frames, daemon=True)
-capture_thread.start()
+threading.Thread(target=capture_frames, daemon=True).start()
 
 # =========================
-# Main face detection loop
+# BLUR CHECK
 # =========================
-count = 0  # Counter for saved faces
-frame_counter = 0
+def is_blurry(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return cv2.Laplacian(gray, cv2.CV_64F).var() < BLUR_THRESHOLD
 
-def detect_face(frame):
-    """Detect faces in the frame using YOLOv8 and return bounding box locations."""
-    # Run YOLOv8 inference on the frame (detect faces)
-    results = model(frame)
+# =========================
+# PERSON DETECTION
+# =========================
+def detect_person(frame):
 
-    # Extract face bounding boxes from results (YOLOv8 format)
-    detections = results[0].boxes  # Access the first result
+    h, w = frame.shape[:2]
+    scale = RESIZE_WIDTH / w
+    resized = cv2.resize(frame, (RESIZE_WIDTH, int(h * scale)))
+
+    results = model(resized, verbose=False)
+
     boxes = []
-    confidences = []
-    class_ids = []
 
-    # Iterate through detections and filter for "person" class (class 0)
-    for det in detections:
-        confidence = det.conf[0].item()  # Confidence score
-        class_id = int(det.cls[0].item())  # Class ID (0 for person)
+    for box in results[0].boxes:
+        conf = float(box.conf[0])
+        cls = int(box.cls[0])
 
-        if confidence > 0.5 and class_id == 0:  # Person class (ID 0 in COCO)
-            x_center, y_center, w, h = det.xywh[0].tolist()  # Center x, y, width, height
-            x = int((x_center - w / 2) * frame.shape[1])
-            y = int((y_center - h / 2) * frame.shape[0])
-            w = int(w * frame.shape[1])
-            h = int(h * frame.shape[0])
+        if conf > CONF_THRESHOLD and cls == 0:
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
 
-            boxes.append([x, y, w, h])
-            confidences.append(confidence)
-            class_ids.append(class_id)
+            x1 = int(x1 / scale)
+            y1 = int(y1 / scale)
+            x2 = int(x2 / scale)
+            y2 = int(y2 / scale)
 
-    return boxes, confidences, class_ids
+            boxes.append((x1, y1, x2, y2))
+
+    return boxes
+
+# =========================
+# MAIN LOOP
+# =========================
+count = 0
+frame_counter = 0
+last_save_time = 0
 
 while True:
-    if len(frame_queue) == 0:
+
+    if not frame_queue:
         continue
 
-    with frame_lock:
-        frame = frame_queue[-1]  # Get the latest frame from the queue
+    original_frame = frame_queue[-1].copy()
+    display_frame = original_frame.copy()
 
     frame_counter += 1
     if frame_counter % FRAME_SKIP != 0:
-        continue  # Skip frames to reduce processing load
+        continue
 
-    # Detect faces using YOLOv8
-    boxes, confidences, class_ids = detect_face(frame)
+    person_boxes = detect_person(original_frame)
 
-    # Show information on the screen
-    msg = f"ID={PERSON_ID}  Name={PERSON_NAME}  Faces={len(boxes)}  Saved={count}/{TARGET_SAMPLES}"
-    cv2.putText(frame, msg, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+    for (x1, y1, x2, y2) in person_boxes:
 
-    if len(boxes) > 0:  # If faces are detected
-        for i in range(len(boxes)):
-            x, y, w, h = boxes[i]
-            confidence = confidences[i]
-            if confidence > 0.5:  # If confidence is high enough (threshold can be adjusted)
-                # Draw bounding box
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        cv2.rectangle(display_frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+        cv2.putText(display_frame, "Person",
+                    (x1, y1 - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, (255, 0, 0), 2)
 
-                # Save the face if detected and it's the 1st time (one face per frame)
-                count += 1
-                filename = f"{PERSON_ID}_CCTV_Face_{count:03d}.jpg"
-                path = os.path.join(SAVE_DIR, filename)
+        # Safe boundary check
+        h, w = original_frame.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
 
-                # Crop face and save
-                face_image = frame[y:y + h, x:x + w]
-                cv2.imwrite(path, face_image)  # Save image as .jpg
-                print(f"[INFO] Saved: {filename}")
+        person_crop = original_frame[y1:y2, x1:x2]
+        if person_crop.size == 0:
+            continue
 
-                if count >= TARGET_SAMPLES:
-                    print("[DONE] Enough samples collected.")
-                    break
+        gray = cv2.cvtColor(person_crop, cv2.COLOR_BGR2GRAY)
 
-    # Show the frame with bounding boxes
-    cv2.imshow("CCTV Face Capture with YOLOv8", frame)
+        faces = face_detector.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(FACE_MIN_SIZE, FACE_MIN_SIZE)
+        )
 
-    # Exit on Q key press
+        # ✅ Only save if exactly ONE face detected
+        if len(faces) != 1:
+            continue
+
+        fx, fy, fw, fh = faces[0]
+
+        face_crop = person_crop[fy:fy+fh, fx:fx+fw]
+        if face_crop.size == 0:
+            continue
+
+        cv2.rectangle(display_frame,
+                      (x1 + fx, y1 + fy),
+                      (x1 + fx + fw, y1 + fy + fh),
+                      (0, 255, 0), 2)
+
+        current_time = time.time()
+
+        # ✅ ONLY FACE SAVING HERE
+        if not is_blurry(face_crop) and (current_time - last_save_time) > SAVE_COOLDOWN:
+
+            count += 1
+            filename = f"{PERSON_ID}_{count:04d}.jpg"
+            cv2.imwrite(os.path.join(SAVE_DIR, filename), face_crop)
+
+            last_save_time = current_time
+
+            cv2.putText(display_frame, "FACE SAVED",
+                        (x1 + fx, y1 + fy - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6, (0,255,0), 2)
+
+            print("[INFO] Face Saved:", filename)
+
+            if count >= TARGET_SAMPLES:
+                capture_flag = False
+                break
+
+    cv2.putText(display_frame, f"Saved: {count}/{TARGET_SAMPLES}",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8, (0,255,0), 2)
+
+    cv2.imshow("PERSON + FACE DETECTION", display_frame)
+
     if cv2.waitKey(1) & 0xFF == ord('q'):
+        capture_flag = False
         break
 
-capture_flag = False
 cap.release()
 cv2.destroyAllWindows()
-print("[FINISHED] Face capture from CCTV using YOLOv8 completed.")
+print("[FINISHED]")
