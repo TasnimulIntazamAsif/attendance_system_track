@@ -1,37 +1,40 @@
 import os
 import cv2
 import torch
-import threading
 import time
-from collections import deque
+import threading
+import math
+import csv
+import uuid
+from datetime import datetime
 from ultralytics import YOLO
 
 # =========================
 # SETTINGS
 # =========================
-CCTV_URL = "rtsp://admin:boss321%23@192.168.2.42:554/cam/realmonitor?channel=1&subtype=0"
-SAVE_DIR = "known_faces"
-PERSON_ID = "new_person"
-TARGET_SAMPLES = 1500
+CCTV_URL = "rtsp://admin:boss321%23@192.168.2.25:554/cam/realmonitor?channel=1&subtype=0"
+BASE_SAVE_DIR = "known_faces"
 
-FRAME_SKIP = 5
-CONF_THRESHOLD = 0.5
-FACE_MIN_SIZE = 80
-BLUR_THRESHOLD = 60
-RESIZE_WIDTH = 640
-SAVE_COOLDOWN = 3  # seconds
+CONF_THRESHOLD = 0.4
+FACE_MIN_SIZE = 60
+SAVE_COOLDOWN = 1
 
-os.makedirs(SAVE_DIR, exist_ok=True)
+RESIZE_WIDTH = 416
+YOLO_IMG_SIZE = 416
+MOVEMENT_THRESHOLD = 15
+
+os.makedirs(BASE_SAVE_DIR, exist_ok=True)
 
 # =========================
-# LOAD YOLO (PERSON ONLY)
+# LOAD MODEL
 # =========================
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = YOLO("yolo26s.pt")
-model.to(device)
 
 if device == "cuda":
+    model.to(device)
     model.model.half()
+    torch.backends.cudnn.benchmark = True
 
 print("[INFO] Device:", device)
 
@@ -43,103 +46,158 @@ face_detector = cv2.CascadeClassifier(
 )
 
 # =========================
-# CONNECT CCTV
+# UNIQUE ID STORAGE
 # =========================
-cap = cv2.VideoCapture(CCTV_URL, cv2.CAP_FFMPEG)
-cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+trackid_to_unique = {}
+unique_image_count = {}
 
-if not cap.isOpened():
+def generate_unique_id():
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    short_uuid = uuid.uuid4().hex[:6].upper()
+    return f"UID_{timestamp}_{short_uuid}"
+
+def log_to_csv(folder_path, unique_id, status, image_name):
+    csv_name = f"{unique_id}_log.csv"
+    csv_path = os.path.join(folder_path, csv_name)
+    file_exists = os.path.isfile(csv_path)
+
+    with open(csv_path, mode="a", newline="") as file:
+        writer = csv.writer(file)
+
+        if not file_exists:
+            writer.writerow(["timestamp", "unique_id", "status", "image_name"])
+
+        writer.writerow([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            unique_id,
+            status,
+            image_name
+        ])
+
+# =========================
+# CAMERA THREAD
+# =========================
+class CameraStream:
+    def __init__(self, url):
+        self.cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.ret, self.frame = self.cap.read()
+        self.running = True
+        threading.Thread(target=self.update, daemon=True).start()
+
+    def update(self):
+        while self.running:
+            self.cap.grab()
+            self.ret, self.frame = self.cap.read()
+
+    def read(self):
+        return self.ret, self.frame
+
+    def stop(self):
+        self.running = False
+        self.cap.release()
+
+stream = CameraStream(CCTV_URL)
+
+if not stream.cap.isOpened():
     print("[FAIL] CCTV not connected")
     exit()
 
 print("[INFO] CCTV Connected")
 
-# =========================
-# FRAME THREAD
-# =========================
-frame_queue = deque(maxlen=1)
-capture_flag = True
+cv2.namedWindow("ULTRA LIVE TRACKING", cv2.WINDOW_NORMAL)
 
-def capture_frames():
-    global capture_flag
-    while capture_flag:
-        ret, frame = cap.read()
-        if ret:
-            frame_queue.append(frame)
-
-threading.Thread(target=capture_frames, daemon=True).start()
-
-# =========================
-# BLUR CHECK
-# =========================
-def is_blurry(img):
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    return cv2.Laplacian(gray, cv2.CV_64F).var() < BLUR_THRESHOLD
-
-# =========================
-# PERSON DETECTION
-# =========================
-def detect_person(frame):
-
-    h, w = frame.shape[:2]
-    scale = RESIZE_WIDTH / w
-    resized = cv2.resize(frame, (RESIZE_WIDTH, int(h * scale)))
-
-    results = model(resized, verbose=False)
-
-    boxes = []
-
-    for box in results[0].boxes:
-        conf = float(box.conf[0])
-        cls = int(box.cls[0])
-
-        if conf > CONF_THRESHOLD and cls == 0:
-            x1, y1, x2, y2 = box.xyxy[0].tolist()
-
-            x1 = int(x1 / scale)
-            y1 = int(y1 / scale)
-            x2 = int(x2 / scale)
-            y2 = int(y2 / scale)
-
-            boxes.append((x1, y1, x2, y2))
-
-    return boxes
+last_save_time = {}
+previous_positions = {}
 
 # =========================
 # MAIN LOOP
 # =========================
-count = 0
-frame_counter = 0
-last_save_time = 0
-
 while True:
 
-    if not frame_queue:
+    ret, frame = stream.read()
+    if not ret:
         continue
 
-    original_frame = frame_queue[-1].copy()
-    display_frame = original_frame.copy()
+    frame_small = cv2.resize(
+        frame,
+        (RESIZE_WIDTH, int(frame.shape[0] * RESIZE_WIDTH / frame.shape[1]))
+    )
 
-    frame_counter += 1
-    if frame_counter % FRAME_SKIP != 0:
+    scale_x = frame.shape[1] / frame_small.shape[1]
+    scale_y = frame.shape[0] / frame_small.shape[0]
+
+    results = model.track(
+        frame_small,
+        persist=True,
+        classes=[0],
+        imgsz=YOLO_IMG_SIZE,
+        conf=CONF_THRESHOLD,
+        tracker="bytetrack.yaml",
+        verbose=False
+    )
+
+    display_frame = frame
+
+    if results[0].boxes.id is None:
+        cv2.imshow("ULTRA LIVE TRACKING", display_frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
         continue
 
-    person_boxes = detect_person(original_frame)
+    boxes = results[0].boxes
 
-    for (x1, y1, x2, y2) in person_boxes:
+    for box, conf, track_id in zip(boxes.xyxy, boxes.conf, boxes.id):
 
-        cv2.rectangle(display_frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-        cv2.putText(display_frame, "Person",
-                    (x1, y1 - 5),
+        if float(conf) < CONF_THRESHOLD:
+            continue
+
+        x1, y1, x2, y2 = box.tolist()
+        x1 = int(x1 * scale_x)
+        y1 = int(y1 * scale_y)
+        x2 = int(x2 * scale_x)
+        y2 = int(y2 * scale_y)
+
+        track_id = int(track_id)
+
+        # ===== ASSIGN UNIQUE ID =====
+        if track_id not in trackid_to_unique:
+            unique_id = generate_unique_id()
+            trackid_to_unique[track_id] = unique_id
+            unique_image_count[unique_id] = 0
+            print(f"[INFO] New Unique ID Created: {unique_id}")
+
+        unique_id = trackid_to_unique[track_id]
+
+        # ===== MOVEMENT =====
+        center_x = (x1 + x2) // 2
+        center_y = (y1 + y2) // 2
+
+        status = "STAY"
+        color = (0, 255, 0)
+
+        if track_id in previous_positions:
+            prev_x, prev_y = previous_positions[track_id]
+            distance = math.hypot(center_x - prev_x, center_y - prev_y)
+
+            if distance > MOVEMENT_THRESHOLD:
+                status = "MOVING"
+                color = (0, 0, 255)
+
+        previous_positions[track_id] = (center_x, center_y)
+
+        cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(display_frame, f"{unique_id} - {status}",
+                    (x1, y1 - 10),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, (255, 0, 0), 2)
+                    0.5, color, 2)
 
-        # Safe boundary check
-        h, w = original_frame.shape[:2]
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
+        current_time = time.time()
+        if track_id in last_save_time:
+            if current_time - last_save_time[track_id] < SAVE_COOLDOWN:
+                continue
 
-        person_crop = original_frame[y1:y2, x1:x2]
+        person_crop = frame[y1:y2, x1:x2]
         if person_crop.size == 0:
             continue
 
@@ -147,59 +205,40 @@ while True:
 
         faces = face_detector.detectMultiScale(
             gray,
-            scaleFactor=1.1,
-            minNeighbors=5,
-            minSize=(FACE_MIN_SIZE, FACE_MIN_SIZE)
+            scaleFactor=1.2,
+            minNeighbors=4,
+            minSize=(40, 40)
         )
 
-        # ✅ Only save if exactly ONE face detected
-        if len(faces) != 1:
+        if len(faces) == 0:
             continue
 
         fx, fy, fw, fh = faces[0]
 
-        face_crop = person_crop[fy:fy+fh, fx:fx+fw]
-        if face_crop.size == 0:
+        if fw < FACE_MIN_SIZE or fh < FACE_MIN_SIZE:
             continue
 
-        cv2.rectangle(display_frame,
-                      (x1 + fx, y1 + fy),
-                      (x1 + fx + fw, y1 + fy + fh),
-                      (0, 255, 0), 2)
+        face_img = person_crop[fy:fy+fh, fx:fx+fw]
 
-        current_time = time.time()
+        folder_path = os.path.join(BASE_SAVE_DIR, unique_id)
+        os.makedirs(folder_path, exist_ok=True)
 
-        # ✅ ONLY FACE SAVING HERE
-        if not is_blurry(face_crop) and (current_time - last_save_time) > SAVE_COOLDOWN:
+        unique_image_count[unique_id] += 1
+        image_name = f"{unique_id}_{unique_image_count[unique_id]:03d}.jpg"
 
-            count += 1
-            filename = f"{PERSON_ID}_{count:04d}.jpg"
-            cv2.imwrite(os.path.join(SAVE_DIR, filename), face_crop)
+        image_path = os.path.join(folder_path, image_name)
+        cv2.imwrite(image_path, face_img)
 
-            last_save_time = current_time
+        log_to_csv(folder_path, unique_id, status, image_name)
 
-            cv2.putText(display_frame, "FACE SAVED",
-                        (x1 + fx, y1 + fy - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6, (0,255,0), 2)
+        last_save_time[track_id] = time.time()
 
-            print("[INFO] Face Saved:", filename)
+        print(f"[INFO] Saved {image_name}")
 
-            if count >= TARGET_SAMPLES:
-                capture_flag = False
-                break
-
-    cv2.putText(display_frame, f"Saved: {count}/{TARGET_SAMPLES}",
-                (20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8, (0,255,0), 2)
-
-    cv2.imshow("PERSON + FACE DETECTION", display_frame)
+    cv2.imshow("ULTRA LIVE TRACKING", display_frame)
 
     if cv2.waitKey(1) & 0xFF == ord('q'):
-        capture_flag = False
         break
 
-cap.release()
+stream.stop()
 cv2.destroyAllWindows()
-print("[FINISHED]")
