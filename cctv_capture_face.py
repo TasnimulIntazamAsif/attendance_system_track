@@ -17,7 +17,7 @@ BASE_SAVE_DIR = "known_faces"
 
 CONF_THRESHOLD = 0.4
 FACE_MIN_SIZE = 60
-SAVE_COOLDOWN = 1
+SAVE_COOLDOWN = 0.5   # faster capture for running
 
 RESIZE_WIDTH = 416
 YOLO_IMG_SIZE = 416
@@ -26,7 +26,7 @@ MOVEMENT_THRESHOLD = 15
 os.makedirs(BASE_SAVE_DIR, exist_ok=True)
 
 # =========================
-# LOAD MODEL
+# LOAD YOLO MODEL
 # =========================
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = YOLO("yolo26s.pt")
@@ -39,10 +39,18 @@ if device == "cuda":
 print("[INFO] Device:", device)
 
 # =========================
-# FACE DETECTOR
+# FACE DETECTORS
 # =========================
-face_detector = cv2.CascadeClassifier(
+frontal_face = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
+
+profile_face = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_profileface.xml"
+)
+
+eye_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_eye.xml"
 )
 
 # =========================
@@ -63,7 +71,6 @@ def log_to_csv(folder_path, unique_id, status, image_name):
 
     with open(csv_path, mode="a", newline="") as file:
         writer = csv.writer(file)
-
         if not file_exists:
             writer.writerow(["timestamp", "unique_id", "status", "image_name"])
 
@@ -73,6 +80,61 @@ def log_to_csv(folder_path, unique_id, status, image_name):
             status,
             image_name
         ])
+
+# =========================
+# SMART FACE VALIDATION
+# =========================
+def is_valid_face(face_img, person_height, fy, status):
+
+    h, w = face_img.shape[:2]
+    if h < 60 or w < 60:
+        return False
+
+    ratio = w / float(h)
+    if ratio < 0.6 or ratio > 1.5:
+        return False
+
+    if fy > person_height * 0.6:
+        return False
+
+    gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
+
+    # Dynamic blur threshold
+    lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    if status == "MOVING":
+        if lap_var < 25:
+            return False
+    else:
+        if lap_var < 60:
+            return False
+
+    # Edge density
+    edges = cv2.Canny(gray, 80, 180)
+    edge_density = edges.mean()
+    if edge_density < 6:
+        return False
+
+    # Skin detection
+    hsv = cv2.cvtColor(face_img, cv2.COLOR_BGR2HSV)
+    lower_skin = (0, 30, 60)
+    upper_skin = (20, 170, 255)
+    mask = cv2.inRange(hsv, lower_skin, upper_skin)
+    skin_ratio = cv2.countNonZero(mask) / (h * w)
+
+    if status == "MOVING":
+        if skin_ratio < 0.12:
+            return False
+    else:
+        if skin_ratio < 0.18:
+            return False
+
+    # Eye detection only for STAY
+    if status == "STAY":
+        eyes = eye_cascade.detectMultiScale(gray, 1.2, 5)
+        if len(eyes) < 1:
+            return False
+
+    return True
 
 # =========================
 # CAMERA THREAD
@@ -160,16 +222,16 @@ while True:
 
         track_id = int(track_id)
 
-        # ===== ASSIGN UNIQUE ID =====
+        # Unique ID assign
         if track_id not in trackid_to_unique:
             unique_id = generate_unique_id()
             trackid_to_unique[track_id] = unique_id
             unique_image_count[unique_id] = 0
-            print(f"[INFO] New Unique ID Created: {unique_id}")
+            print(f"[INFO] New Unique ID: {unique_id}")
 
         unique_id = trackid_to_unique[track_id]
 
-        # ===== MOVEMENT =====
+        # Movement detection
         center_x = (x1 + x2) // 2
         center_y = (y1 + y2) // 2
 
@@ -179,7 +241,6 @@ while True:
         if track_id in previous_positions:
             prev_x, prev_y = previous_positions[track_id]
             distance = math.hypot(center_x - prev_x, center_y - prev_y)
-
             if distance > MOVEMENT_THRESHOLD:
                 status = "MOVING"
                 color = (0, 0, 255)
@@ -189,8 +250,7 @@ while True:
         cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
         cv2.putText(display_frame, f"{unique_id} - {status}",
                     (x1, y1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5, color, 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
         current_time = time.time()
         if track_id in last_save_time:
@@ -201,18 +261,16 @@ while True:
         if person_crop.size == 0:
             continue
 
-        gray = cv2.cvtColor(person_crop, cv2.COLOR_BGR2GRAY)
+        gray_person = cv2.cvtColor(person_crop, cv2.COLOR_BGR2GRAY)
 
-        faces = face_detector.detectMultiScale(
-            gray,
-            scaleFactor=1.2,
-            minNeighbors=4,
-            minSize=(40, 40)
-        )
+        faces1 = frontal_face.detectMultiScale(gray_person, 1.2, 5)
+        faces2 = profile_face.detectMultiScale(gray_person, 1.2, 5)
+        faces = list(faces1) + list(faces2)
 
         if len(faces) == 0:
             continue
 
+        faces = sorted(faces, key=lambda x: x[2]*x[3], reverse=True)
         fx, fy, fw, fh = faces[0]
 
         if fw < FACE_MIN_SIZE or fh < FACE_MIN_SIZE:
@@ -220,20 +278,21 @@ while True:
 
         face_img = person_crop[fy:fy+fh, fx:fx+fw]
 
+        if not is_valid_face(face_img, person_crop.shape[0], fy, status):
+            continue
+
         folder_path = os.path.join(BASE_SAVE_DIR, unique_id)
         os.makedirs(folder_path, exist_ok=True)
 
         unique_image_count[unique_id] += 1
         image_name = f"{unique_id}_{unique_image_count[unique_id]:03d}.jpg"
 
-        image_path = os.path.join(folder_path, image_name)
-        cv2.imwrite(image_path, face_img)
-
+        cv2.imwrite(os.path.join(folder_path, image_name), face_img)
         log_to_csv(folder_path, unique_id, status, image_name)
 
         last_save_time[track_id] = time.time()
 
-        print(f"[INFO] Saved {image_name}")
+        print(f"[INFO] Face Saved: {image_name}")
 
     cv2.imshow("ULTRA LIVE TRACKING", display_frame)
 
