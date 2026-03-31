@@ -1,4 +1,4 @@
-<img width="700" height="1322" alt="Screenshot 2026-03-31 131002" src="https://github.com/user-attachments/assets/d1a50b01-8b62-4ba8-b527-4a478622f892" /># 🎯 Flask Face Recognition Attendance System with Smart CCTV Face Capture & Multi-Person Tracking System
+## 🎯 Flask Face Recognition Attendance System with Smart CCTV Face Capture & Multi-Person Tracking System
 📌 Overview
 
 This project is a real-time CCTV-based face capture and multi-person tracking system built using YOLO (Ultralytics) and OpenCV.
