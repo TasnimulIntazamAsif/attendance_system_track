@@ -9,6 +9,16 @@ The system uses a webcam to detect and recognize faces, mark attendance, and dis
 <img width="2248" height="1472" alt="Screenshot 2026-02-25 115436" src="https://github.com/user-attachments/assets/5c236a3d-89c1-4303-bf6c-431259ae116d" />
 
 
+## iMAGE CAPTURING THROUGH TRACKING
+
+<img width="2210" height="1207" alt="Screenshot 2026-03-31 130236" src="https://github.com/user-attachments/assets/f6215dc7-0365-45dc-8337-9cef3a768ad5" />
+
+
+<img width="2201" height="1173" alt="Screenshot 2026-03-31 130428" src="https://github.com/user-attachments/assets/f0935496-a4fa-4c45-8b5b-8c0cf839fb73" />
+
+
+
+
 
 
 ## 🚀 Features
